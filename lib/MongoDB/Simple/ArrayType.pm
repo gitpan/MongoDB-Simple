@@ -2,7 +2,7 @@ package MongoDB::Simple::ArrayType;
 
 use strict;
 use warnings;
-our $VERSION = '0.001';
+our $VERSION = '0.002';
 
 use Tie::Array;
 our @ISA = ('Tie::Array');
