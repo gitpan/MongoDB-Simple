@@ -2,7 +2,7 @@ package MongoDB::Simple;
 
 use strict;
 use warnings;
-our $VERSION = '0.003';
+our $VERSION = '0.004';
 
 use Exporter;
 our @EXPORT = qw/ collection string date array object parent dbref boolean oid database locator matches /;
