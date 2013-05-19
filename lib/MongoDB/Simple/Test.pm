@@ -2,6 +2,7 @@ package MongoDB::Simple::Test;
 
 use MongoDB::Simple;
 our @ISA = ('MongoDB::Simple');
+our $data = {};
 
 database 'mtest';
 collection 'items';
@@ -24,6 +25,29 @@ array 'tags'         => undef;
 object 'metadata'    => { type => 'MongoDB::Simple::Test::Meta' };
 array 'labels'       => { type => 'MongoDB::Simple::Test::Label' };
 array 'multi'        => { types => [ 'MongoDB::Simple::Test::Meta', 'MongoDB::Simple::Test::Label' ] };
+object 'hash'        => undef;
+array 'callbacks'    => {
+    'changed' => sub {
+        my ($self, $value) = @_;
+        $MongoDB::Simple::Test::data->{changed} = $value;
+    },
+    'pop' => sub {
+        my ($self, $value) = @_;
+        $MongoDB::Simple::Test::data->{pop} = $value;
+    },
+    'push' => sub {
+        my ($self, $value) = @_;
+        $MongoDB::Simple::Test::data->{push} = $value;
+    },
+    'shift' => sub {
+        my ($self, $value) = @_;
+        $MongoDB::Simple::Test::data->{shift} = $value;
+    },
+    'unshift' => sub {
+        my ($self, $value) = @_;
+        $MongoDB::Simple::Test::data->{unshift} = $value;
+    }
+};
 
 ################################################################################
 
@@ -31,8 +55,6 @@ package MongoDB::Simple::Test::Meta;
 
 use MongoDB::Simple;
 our @ISA = ('MongoDB::Simple');
-
-#parent type => 'MongoDB::Simple::Test', key => 'metadata';
 
 matches sub {
     my ($doc) = @_;
@@ -42,6 +64,7 @@ matches sub {
 };
 
 string 'type'  => undef;
+object 'label' => { type => 'MongoDB::Simple::Test::Label' };
 
 ################################################################################
 
@@ -49,8 +72,6 @@ package MongoDB::Simple::Test::Label;
 
 use MongoDB::Simple;
 our @ISA = ('MongoDB::Simple');
-
-#parent type => 'MongoDB::Simple::Test', key => 'labels';
 
 matches sub {
     my ($doc) = @_;

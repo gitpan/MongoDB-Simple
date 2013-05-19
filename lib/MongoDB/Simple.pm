@@ -2,13 +2,14 @@ package MongoDB::Simple;
 
 use strict;
 use warnings;
-our $VERSION = '0.004';
+our $VERSION = '0.005';
 
 use Exporter;
 our @EXPORT = qw/ collection string date array object parent dbref boolean oid database locator matches /;
 
 use MongoDB;
 use MongoDB::Simple::ArrayType;
+use MongoDB::Simple::HashType;
 
 use Switch;
 use DateTime;
@@ -63,13 +64,14 @@ sub new {
         'col'           => undef, # stores the collection (or can be passed in)
         'meta'          => undef, # stores the keyword metadata
         'doc'           => {}, # stores the document
-        'changes'       => {}, # stores changes made since load/save
-        'callbacks'     => [], # stores callbacks needed for changes
+        'changes'       => [], # stores changes made since load/save
         'parent'        => undef, # stores the parent object
+        'field'         => undef, # stores the field name from the parent object
+        'index'         => undef, # stores the index (if the item is in an array)
         'objcache'      => {}, # stores created objects
         'arraycache'    => {}, # stores array objects
         'existsInDb'    => 0,
-        'debugMode'     => 0,
+        'debugMode'     => $ENV{'MONGODB_SIMPLE_DEBUG'} // 0,
         'forceUnshiftOperator' => 0, # forces implementation of unshift to work as expected
         'warnOnUnshiftOperator' => 1, # enables a warning when unshift is used against an array without forceUnshiftOperator
         %args
@@ -134,7 +136,7 @@ sub load {
 
     $self->{existsInDb} = 1;
     $self->{doc} = $doc;
-    $self->{changes} = {};
+    $self->{changes} = [];
     $self->{callbacks} = [];
     $self->{objcache} = {};
     $self->{arraycache} = {};
@@ -160,33 +162,114 @@ sub getLocator {
     return $id;
 }
 
+sub registerChange {
+    my ($self, $field, $change, $value, $callbacks) = @_;
+
+    # called by accessors and child objects/arrays
+
+    # e.g. 
+    #   registerChange($self, 'name', '$set', 'Test');
+    #   registerChange($self, 'tags', '$push', 'Tag');
+
+    # if no parent, store in {changes}
+    # if parent -> parent->registerChange
+    #   registerChange($self, $self->{field} . '.' . $field, $change, $value);
+    
+    $self->log("registerChange: field[$field], change[$change], value[" . ($value ? $value : '<undef>') . "]");
+
+    if($self->{parent}) {
+        $self->log("  -- passing to parent (index: " . (defined $self->{index} ? $self->{index} : 'none') . ")");
+        $self->{parent}->registerChange($self->{field} . ( defined $self->{index} ? '.' . $self->{index} : '' ) . '.' . $field, $change, $value, $callbacks);
+        return;
+    }
+
+    push @{$self->{changes}}, {
+        field => $field,
+        change => $change,
+        value => $value,
+        callbacks => $callbacks
+    };
+
+    # change saving to just run all updates in order
+    # if we do all $set's like we do now, we can't do this and expect it to work:
+    #    $obj->arraytype(['a','b','c']);
+    #    pop $obj->arraytype;
+    #    $obj->arraytype(['a','b','c']);
+    #    $obj->save; # arraytype now contains ['a','b'] since pop happened after both sets
+}
+
 sub save {
     my ($self) = @_;
 
     if($self->{existsInDb}) {
-        $self->log("Save:: updates:");
-        my $updates = $self->getUpdates;
-        $self->log(Dumper $updates);
-        if(scalar keys %$updates == 0) {
-            $self->log("No updates found, not saving");
-            return 0;
-        }
+        $self->log("Save::");
         $self->log("Exists in db, locator: " . $self->getLocator);
-        $self->{col}->update($self->getLocator, $updates);
-        $self->{changes} = {};
-        for my $cb (@{$self->{callbacks}}) {
-            &$cb;
+
+        # We'll update in a particular order
+        $self->log("Changes::");
+        $self->log(Dumper $self->{changes});
+
+        # TODO can optimise changes, e.g. collapsing array operations
+
+        for my $change (@{$self->{changes}}) {
+            if($change->{change} eq '$unshift') {
+                # rewrite array - $unshift needs to set the field as array and value as array, not as array item
+                $self->{col}->update($self->getLocator, {
+                    '$set' => {
+                        $change->{field} => $change->{value}
+                    }
+                });
+            } else {
+                if($change->{change} eq '$shift') {
+                    $change->{change} = '$pop';
+                    $change->{value} = -1;
+                } 
+                $self->{col}->update($self->getLocator, {
+                    $change->{change} => {
+                        $change->{field} => $change->{value}
+                    }
+                });
+            }
+            if($change->{callbacks}) {
+                $self->log("Running callbacks for field " . $change->{field});
+                for my $cb (@{$change->{callbacks}}) {
+                    &$cb;
+                }
+            }
         }
-        $self->{callbacks} = [];
+        
+        # Changes here are saved too, also empty array
+        $self->{changes} = [];
     } else {
-        my $changes = $self->{changes};
-        $self->log("Save:: changes:");
-        $self->log(Dumper $changes);
-        $self->log("Doesn't exist in db");
-        my $id = $self->{col}->insert($changes);
+        my $obj = {};
+        $self->log("Save:: insert");
+        for my $field (keys %{$self->{meta}->{fields}}) {
+            $self->log("checking field $field");
+            # TODO perhaps should be a difference between unset and undefined?
+            if($self->$field) {
+                $self->log("field $field has a value: " . $self->$field);
+                if($self->{meta}->{fields}->{$field}->{type} =~ /array/i) {
+                    $self->log("field $field is an array");
+                    $obj->{$field} = $self->{arraycache}->{$field}->{objref}->{doc};
+                } elsif ($self->{meta}->{fields}->{$field}->{type} =~ /object/i) {
+                    $self->log("field $field is an object");
+                    my $o = $self->$field;
+                    $self->log(Dumper $o);
+                    $self->log(ref $o);
+                    $obj->{$field} = ref $o eq 'HASH' ? $o : $o->{doc};
+                } else {
+                    $self->log("field $field is a scalar:");
+                    $self->log(Dumper $self->$field);
+                    $obj->{$field} = $self->$field;
+                }
+            }
+        }
+
+        $self->log(Dumper $obj);
+        my $id = $self->{col}->insert($obj);
         $self->{existsInDb} = 1;
-        $self->{changes} = {};
-        $self->{callbacks} = [];
+        # TODO what about inner object changes
+        $self->{changes} = [];
         $self->log(Dumper $id);
         return $id;
     }
@@ -195,60 +278,7 @@ sub save {
 sub hasChanges {
     my ($self) = @_;
 
-    return scalar keys %{$self->{changes}} > 0 ? 1 : 0;
-}
-
-sub getUpdates {
-    my ($self) = @_;
-
-    $self->log("getUpdates for " . ref($self));
-    my %changes = ();
-
-    # Start with anything added to the changes hash
-    for my $key (keys %{$self->{changes}}) {
-        # Arrays are done below
-        next if $self->{meta}->{fields}->{$key}->{type} =~ /array/i;
-
-        $self->log(" - adding change for $key:");
-        $self->log(Dumper $self->{changes}->{$key});
-        $changes{'$set'}{$key} = $self->{changes}->{$key};
-    }
-
-    # Next loop fields looking for objects or arrays
-    for my $field (keys %{$self->{meta}->{fields}}) {
-        $self->log("checking field $field");
-        if($self->{meta}->{fields}->{$field}->{type} =~ /object/i) {
-            $self->log(" - field $field is object type");
-            my $obj = $self->$field;
-            my $chng = ref($obj) && ref($obj) !~ /HASH/ ? $obj->getUpdates : $obj;
-            $self->log(Dumper $chng);
-            for my $chg (keys %{$chng->{'$set'}}) {
-                $changes{'$set'}{"$field.$chg"} = $chng->{'$set'}->{$chg};
-            }
-        }
-        if($self->{meta}->{fields}->{$field}->{type} =~ /array/i) {
-            $self->log(" - field $field is array type");
-            $self->$field; # triggers array initialisation if it hasn't already happened
-            my $arr = $self->{arraycache}->{$field}->{objref};
-            my $chng = $arr->{changes};
-            $self->log(Dumper $chng);
-            my %types = ( '$push' => '$pushAll' );
-            for my $type (keys %types) {
-                my $mtype = $types{$type}; 
-                for my $chg (@{$chng->{$type}}) {
-                    $changes{$mtype}{$field} = [] if !$changes{$mtype}{"$field"};
-                    if($self->{meta}->{fields}->{$field}->{args}->{type} || $self->{meta}->{fields}->{$field}->{args}->{types}) {
-                        push @{$changes{$mtype}{"$field"}}, $chg->{doc};
-                    } else {
-                        push @{$changes{$mtype}{"$field"}}, $chg;
-                    }
-                }
-            }
-        }
-    }
-
-    $self->log(Dumper \%changes);
-    return \%changes;
+    return scalar @{$self->{changes}} > 0 ? 1 : 0;
 }
 
 sub dump {
@@ -265,29 +295,51 @@ sub dump {
 ################################################################################
 
 sub lookForCallbacks {
-    my ($self, $field, $value) = @_;
+    my ($self, $field, $value, $type) = @_;
 
-    if($self->{meta}->{fields}->{$field}->{args}->{changed}) {
-        push $self->{callbacks}, sub {
-            my $cb = $self->{meta}->{fields}->{$field}->{args}->{changed};
-            &$cb($self, $value);
-        };
+    my @callbacks = ();
+    $self->log("lookForCallbacks: field[$field], value[" . ($value ? $value : '<undef>') . "]");
+    if(!$type || $type eq '$set') {
+        if($self->{meta}->{fields}->{$field}->{args}->{changed}) {
+            $self->log("lookForCallbacks: adding 'changed' callback for field '$field'");
+            push @callbacks, sub {
+                my $cb = $self->{meta}->{fields}->{$field}->{args}->{changed};
+                $self->log("callback capture: field[$field], value[" . ($value ? $value : '<undef>') . "]");
+                &$cb($self, $value);
+            };
+        }
     }
+    if($self->{meta}->{fields}->{$field}->{type} && $self->{meta}->{fields}->{$field}->{type} eq 'array') {
+        for my $callback ("push", "pop", "shift", "unshift") {
+            next if $type && $type ne "\$$callback";
+
+            if($self->{meta}->{fields}->{$field}->{args}->{$callback}) {
+                $self->log("lookForCallbacks: adding '$callback' callback for field '$field'");
+                push @callbacks, sub {
+                    my $cb = $self->{meta}->{fields}->{$field}->{args}->{$callback};
+                    $self->log("callback capture: field[$field], value[" . ($value ? $value : '<undef>') . "]");
+                    &$cb($self, $value);
+                };
+            }
+        }
+    }
+    return \@callbacks;
 }
 sub defaultAccessor {
     my ($self, $field, $value) = @_;
 
+    $self->log("defaultAccessor: field[$field], value[" . ($value ? $value : '<undef>') . "]");
+
     if(scalar @_ <= 2) {
-        return $self->{changes}->{$field} // $self->{doc}->{$field};
+        return $self->{doc}->{$field};
     }
 
     return if $self->{doc} && $value && $self->{doc}->{$field} && $value eq $self->{doc}->{$field};
 
-    $self->{changes}->{$field} = $value;
+    my $callbacks = $self->lookForCallbacks($field, $value);
+    $self->registerChange($field, '$set', $value, $callbacks);
     # XXX unsure if we want to set doc or not.... if we do, it makes insert/upsert easier
     $self->{doc}->{$field} = $value;
-
-    $self->lookForCallbacks($field, $value);
 }
 
 sub stringAccessor {
@@ -300,7 +352,7 @@ sub dateAccessor {
     my ($self, $field, $value) = @_;
 
     if(scalar @_ <= 2) {
-        $value = $self->{changes}->{$field} // $self->{doc}->{$field};
+        $value = $self->{doc}->{$field};
         $value = DateTime::Format::W3CDTF->new->parse_datetime($value) if $value;
         return $value;
     }
@@ -311,11 +363,10 @@ sub dateAccessor {
 
     return if $self->{doc} && $value && $self->{doc}->{$field} && $value eq $self->{doc}->{$field};
 
-    $self->{changes}->{$field} = $value;
+    my $callbacks = $self->lookForCallbacks($field, $value);
+    $self->registerChange($field, '$set', $value, $callbacks);
     # XXX unsure if we want to set doc or not.... if we do, it makes insert/upsert easier
     $self->{doc}->{$field} = $value;
-
-    $self->lookForCallbacks($field, $value);
 }
 sub arrayAccessor {
     my ($self, $field, $value) = @_;
@@ -332,7 +383,7 @@ sub arrayAccessor {
                 my $type = $self->{meta}->{fields}->{$field}->{args}->{type};
                 my $types = $self->{meta}->{fields}->{$field}->{args}->{types};
                 if($type) {
-                    push @arr, $type->new(parent => $self, doc => $item);
+                    push @arr, $type->new(parent => $self, doc => $item, field => $field, index => scalar @arr);
                 } elsif ($types) {
                     my $matched = 0;
                     for my $type (@$types) {
@@ -340,7 +391,7 @@ sub arrayAccessor {
                             my $matcher = $metadata{$type}->{matches};
                             my $matches = &$matcher($item);
                             if($matches) {
-                                push @arr, $type->new(parent => $self, doc => $item);
+                                push @arr, $type->new(parent => $self, doc => $item, field => $field, index => scalar @arr);
                                 $matched = 1;
                                 last;
                             }
@@ -353,14 +404,16 @@ sub arrayAccessor {
                     push @arr, $item;
                 }
             }
-        }
-        my $a = tie my @array, 'MongoDB::Simple::ArrayType', parent => $self, field => $field, array => \@arr;
-        $self->{arraycache}->{$field} = {
-            arrayref => \@array,
-            objref => $a
-        };
 
-        return \@array;
+            my $a = tie my @array, 'MongoDB::Simple::ArrayType', parent => $self, field => $field, array => \@arr;
+            $self->{arraycache}->{$field} = {
+                arrayref => \@array,
+                objref => $a
+            };
+            return \@array;
+        }
+
+        return undef;
     }
 
     return if $self->{doc} && $value && $self->{doc}->{$field} && $value eq $self->{doc}->{$field};
@@ -374,13 +427,17 @@ sub arrayAccessor {
         };
         push @array, @$value;
         $value = $a->{array};
+        #$value = \@array;
     }
 
-    $self->{changes}->{$field} = $value;
+    # Don't think we want to do this... it causes an array to be seen as a change, but its handled separately
+    # $self->{changes}->{$field} = $value;
+    #$self->registerChange($field, '$set', $value, $callbacks);
+
     # XXX unsure if we want to set doc or not.... if we do, it makes insert/upsert easier
     $self->{doc}->{$field} = $value;
 
-    $self->lookForCallbacks($field, $value);
+    #$self->lookForCallbacks($field, $value);
 }
 sub objectAccessor {
     my ($self, $field, $value) = @_;
@@ -389,31 +446,57 @@ sub objectAccessor {
     my $obj;
 
     if(scalar @_ <= 2) {
-        if($type) {
-            if($self->{objcache}->{$field}) {
-                return $self->{objcache}->{$field};
-            }
-            if($self->{doc}->{$field}) {
-                $obj = $type->new(parent => $self, doc => $self->{doc}->{$field});
+        if(defined $self->{doc}->{$field}) {
+            if($type) {
+                if($self->{objcache}->{$field}) {
+                    return $self->{objcache}->{$field};
+                }
+                $obj = $type->new(parent => $self, doc => $self->{doc}->{$field}, field => $field);
                 $self->{objcache}->{$field} = $obj;
+                return $obj;
+            } else {
+                if($self->{objcache}->{$field}) {
+                    $self->log("Returning already tied hash for field [$field] on getter");
+                    #return $self->{objcache}->{$field}->{hash};
+                    return $self->{objcache}->{$field}->{hashref};
+                }
+                my %hashx = (%{$self->{doc}->{$field}});
+                $self->log("Tying hash for field [$field] on getter");
+                $obj = tie %hashx, 'MongoDB::Simple::HashType', hash => $self->{doc}->{$field}, parent => $self, field => $field;
+                $self->{objcache}->{$field} = {
+                    objref => $obj,
+                    hashref => \%hashx
+                };
+                #$self->{doc}->{$field} = \%hashx;
+                return $self->{doc}->{$field};
             }
-            return $obj;
+        } else {
+            return undef;
         }
-        return $self->{doc}->{$field};
     }
 
     if(ref($value) !~ /^HASH$/) {
         $self->{objcache}->{$field} = $value;
         $value->{parent} = $self;
+        $value->{field} = $field;
         $value = $value->{doc};
+    } else {
+        if(!tied($value)) {
+            my %hashx;
+            $self->log("Tying hash for field [$field] on setter");
+            my $obj = tie %hashx, 'MongoDB::Simple::HashType', hash => $value, parent => $self, field => $field;
+            $self->{objcache}->{$field} = {
+                objref => $obj,
+                hashref => \%hashx
+            };
+        }
     }
     return if $self->{doc} && $value && $self->{doc}->{$field} && $value eq $self->{doc}->{$field};
 
-    $self->{changes}->{$field} = $value;
+    my $callbacks = $self->lookForCallbacks($field, $value);
+    $self->registerChange($field, '$set', $value, $callbacks);
     # XXX unsure if we want to set doc or not.... if we do, it makes insert/upsert easier
     $self->{doc}->{$field} = $value;
-
-    $self->lookForCallbacks($field, $value);
 } 
 sub dbrefAccessor {
     return defaultAccessor(@_);

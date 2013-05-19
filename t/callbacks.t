@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-use Test::More tests => 1;
+use Test::More tests => 2;
 use Test::Warn;
 
 use strict;
@@ -43,6 +43,7 @@ sub makeNewObject {
     $obj->attr({ key1 => 'key 1', key2 => 'key 2' });
     $obj->tags(['tag1', 'tag2']);
     $obj->metadata($meta);
+    $obj->labels([]);
     push $obj->labels, $label;
 
     my $id = $obj->save;
@@ -64,7 +65,7 @@ subtest 'Updating dupliacted data' => sub {
         is_deeply($obj->{doc}, {
             "_id" => $id,
             "name" => 'Test name',
-            "created" => DateTime::Format::W3CDTF->parse_datetime($dt) . 'Z',
+            "created" => DateTime::Format::W3CDTF->parse_datetime($dt),
             "available" => true,
             "attr" => { key1 => 'key 1', key2 => 'key 2' },
             "tags" => ['tag1', 'tag2'],
@@ -76,7 +77,7 @@ subtest 'Updating dupliacted data' => sub {
                     "text" => 'test label'
                 }
             ]
-        }, 'Correct document returned by MongoDB driver');
+        }, 'Correct document returned by MongoDB driver after makeNewObject');
 
         my $dup = new MongoDB::Simple::Test::Duplicate(client => $client);
         $dup->item_id({'$ref' => 'items', '$id' => $id});
@@ -90,5 +91,61 @@ subtest 'Updating dupliacted data' => sub {
 
         $dup->load($id);
         is($dup->name, 'New name', 'Name in duplicate data has changed');
+    }
+};
+
+subtest 'Array callbacks' => sub {
+    plan tests => 7;
+
+    SKIP: {
+        skip 'MongoDB connection rquired for test', 7 if !$client;
+
+        my ($id, $dt, $meta, $label) = makeNewObject;
+
+        my $obj = new MongoDB::Simple::Test(client => $client);
+        $obj->load($id);
+        is($obj->hasChanges, 0, 'Loaded document has no changes');
+
+        is_deeply($obj->{doc}, {
+            "_id" => $id,
+            "name" => 'Test name',
+            "created" => DateTime::Format::W3CDTF->parse_datetime($dt),
+            "available" => true,
+            "attr" => { key1 => 'key 1', key2 => 'key 2' },
+            "tags" => ['tag1', 'tag2'],
+            "metadata" => {
+                "type" => 'meta type'
+            },
+            "labels" => [
+                {
+                    "text" => 'test label'
+                }
+            ]
+        }, 'Correct document returned by MongoDB driver after makeNewObject');
+
+        $obj->callbacks([]);
+        $obj->save;
+
+        push $obj->callbacks, "test";
+        $obj->save;
+        is($MongoDB::Simple::Test::data->{push}, "test", "push callback is called");
+
+        my $item = pop $obj->callbacks;
+        $obj->save;
+        is($MongoDB::Simple::Test::data->{pop}, $item, "pop callback is called");
+
+        $obj->{warnOnUnshiftOperator} = 0;
+        unshift $obj->callbacks, "unshift";
+        $obj->save;
+        is($MongoDB::Simple::Test::data->{push}, "unshift", "push callback is called when array is unshifed without forceUnshiftOperator");
+
+        $obj->{forceUnshiftOperator} = 1;
+        unshift $obj->callbacks, "real unshift";
+        $obj->save;
+        is($MongoDB::Simple::Test::data->{unshift}, "real unshift", "unshift callback is called when array is unshifted with forceUnshiftOperator");
+
+        $item = shift $obj->callbacks;
+        $obj->save;
+        is($MongoDB::Simple::Test::data->{shift}, "real unshift", "shift callback is called when array is shifted");
     }
 };
